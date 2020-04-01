@@ -40,24 +40,16 @@ def hash(x):
     return sha256(x).digest()
 
 
-def compute_domain(domain_type: DomainType, fork_version: Optional[Version]=None) -> Domain:
-    """
-    Return the domain for the ``domain_type`` and ``fork_version``.
-    """
-    if fork_version is None:
-        fork_version = GENESIS_FORK_VERSION
-    return Domain(domain_type + fork_version)
 
-
-def compute_signing_root(ssz_object: View, domain: Domain) -> Root:
+def compute_fork_data_root(current_version: Version, genesis_validators_root: Root) -> Root:
     """
-    Return the signing root of an object by calculating the root of the object-domain tree.
+    Return the 32-byte fork data root for the ``current_version`` and ``genesis_validators_root``.
+    This is used primarily in signature domains to avoid collisions across forks/chains.
     """
-    domain_wrapped_object = SigningRoot(
-        object_root=hash_tree_root(ssz_object),
-        domain=domain,
-    )
-    return hash_tree_root(domain_wrapped_object)
+    return hash_tree_root(ForkData(
+        current_version=current_version,
+        genesis_validators_root=genesis_validators_root,
+    ))
 
 
 # ShuffleList shuffles a list, using the given seed for randomness. Mutates the input list.
@@ -389,16 +381,6 @@ class EpochsContext(object):
         return self.proposers[slot % SLOTS_PER_EPOCH]
 
 
-# TODO maybe optimize, put it into EpochsContext?
-def get_domain(state: BeaconState, domain_type: DomainType, epoch: Epoch=None) -> Domain:
-    """
-    Return the signature domain (fork version concatenated with domain type) of a message.
-    """
-    epoch = compute_epoch_at_slot(state.slot) if epoch is None else epoch
-    fork_version = state.fork.previous_version if epoch < state.fork.epoch else state.fork.current_version
-    return compute_domain(domain_type, fork_version)
-
-
 FLAG_PREV_SOURCE_ATTESTER = 1 << 0
 FLAG_PREV_TARGET_ATTESTER = 1 << 1
 FLAG_PREV_HEAD_ATTESTER = 1 << 2
@@ -654,12 +636,10 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
                     status.flags |= target_flag
                     target_stake += status.validator.effective_balance
 
-                # TODO: from v0.10->v0.11, this moves under the above target condition.
-                # head rewards become a subset of target rewards.
-                # If the attestation is for the head (att the time of attestation):
-                if att_voted_head_root:
-                    status.flags |= head_flag
-                    head_stake += status.validator.effective_balance
+                    # Head votes must be a subset of target votes
+                    if att_voted_head_root:
+                        status.flags |= head_flag
+                        head_stake += status.validator.effective_balance
 
         epoch_stake_sum.source_stake = source_stake
         epoch_stake_sum.target_stake = target_stake
@@ -771,12 +751,15 @@ def get_attestation_deltas(epochs_ctx: EpochsContext, process: EpochProcess, sta
                 stake += st.validator.effective_balance
         return Gwei(stake)
 
-    prev_epoch_source_stake = get_attesters_stake(FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED)
-    prev_epoch_target_stake = get_attesters_stake(FLAG_PREV_TARGET_ATTESTER | FLAG_UNSLASHED)
-    prev_epoch_head_stake = get_attesters_stake(FLAG_PREV_HEAD_ATTESTER | FLAG_UNSLASHED)
+    increment = EFFECTIVE_BALANCE_INCREMENT  # Factored out from balance totals to avoid uint64 overflow
+    prev_epoch_source_stake = get_attesters_stake(FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED) // increment
+    prev_epoch_target_stake = get_attesters_stake(FLAG_PREV_TARGET_ATTESTER | FLAG_UNSLASHED) // increment
+    prev_epoch_head_stake = get_attesters_stake(FLAG_PREV_HEAD_ATTESTER | FLAG_UNSLASHED) // increment
 
     balance_sq_root = integer_squareroot(total_balance)
     finality_delay = process.prev_epoch - state.finalized_checkpoint.epoch
+
+    total_balance = total_balance // increment
 
     for i, status in enumerate(process.statuses):
         if status.flags & FLAG_ELIGIBLE_ATTESTER != 0:
@@ -884,20 +867,24 @@ def process_slashings(epochs_ctx: EpochsContext, process: EpochProcess, state: B
         decrease_balance(state, index, penalty)
 
 
+HYSTERESIS_INCREMENT = EFFECTIVE_BALANCE_INCREMENT // HYSTERESIS_QUOTIENT
+DOWNWARD_THRESHOLD = HYSTERESIS_INCREMENT * HYSTERESIS_DOWNWARD_MULTIPLIER
+UPWARD_THRESHOLD = HYSTERESIS_INCREMENT * HYSTERESIS_UPWARD_MULTIPLIER
+
+
 def process_final_updates(epochs_ctx: EpochsContext, process: EpochProcess, state: BeaconState) -> None:
     current_epoch = process.current_epoch
     next_epoch = Epoch(current_epoch + 1)
 
     # Reset eth1 data votes
-    if (state.slot + 1) % SLOTS_PER_ETH1_VOTING_PERIOD == 0:
+    if next_epoch % EPOCHS_PER_ETH1_VOTING_PERIOD == 0:
         state.eth1_data_votes = []
 
     # Update effective balances with hysteresis
     for index, status in enumerate(process.statuses):
         balance = state.balances[index]
-        HALF_INCREMENT = EFFECTIVE_BALANCE_INCREMENT // 2
         effective_balance = status.validator.effective_balance
-        if balance < effective_balance or effective_balance + 3 * HALF_INCREMENT < balance:
+        if balance + DOWNWARD_THRESHOLD < effective_balance or effective_balance + UPWARD_THRESHOLD < balance:
             new_effective_balance = min(balance - balance % EFFECTIVE_BALANCE_INCREMENT, MAX_EFFECTIVE_BALANCE)
             state.validators[index].effective_balance = new_effective_balance
 
@@ -918,20 +905,23 @@ def process_final_updates(epochs_ctx: EpochsContext, process: EpochProcess, stat
 
 
 def process_block_header(epochs_ctx: EpochsContext, state: BeaconState, block: BeaconBlock) -> None:
+    slot = state.slot
     # Verify that the slots match
-    assert block.slot == state.slot
+    assert block.slot == slot
+    # Verify that proposer index is the correct index
+    proposer_index = epochs_ctx.get_beacon_proposer(slot)
+    assert block.proposer_index == proposer_index
     # Verify that the parent matches
     assert block.parent_root == hash_tree_root(state.latest_block_header)
     # Cache current block as the new latest block
     state.latest_block_header = BeaconBlockHeader(
-        slot=block.slot,
+        slot=slot,
         parent_root=block.parent_root,
         state_root=Bytes32(),  # Overwritten in the next process_slot call
         body_root=hash_tree_root(block.body),
     )
 
     # Verify proposer is not slashed
-    proposer_index = epochs_ctx.get_beacon_proposer(state.slot)
     proposer = state.validators[proposer_index]
     assert not proposer.slashed
 
@@ -950,7 +940,7 @@ def process_randao(epochs_ctx: EpochsContext, state: BeaconState, body: BeaconBl
 
 def process_eth1_data(epochs_ctx: EpochsContext, state: BeaconState, body: BeaconBlockBody) -> None:
     state.eth1_data_votes.append(body.eth1_data)
-    if state.eth1_data_votes.count(body.eth1_data) * 2 > SLOTS_PER_ETH1_VOTING_PERIOD:
+    if state.eth1_data_votes.count(body.eth1_data) * 2 > EPOCHS_PER_ETH1_VOTING_PERIOD * SLOTS_PER_EPOCH:
         state.eth1_data = body.eth1_data
 
 
@@ -964,7 +954,6 @@ def process_operations(epochs_ctx: EpochsContext, state: BeaconState, body: Beac
             (body.attestations, process_attestation),
             (body.deposits, process_deposit),
             (body.voluntary_exits, process_voluntary_exit),
-            # @process_shard_receipt_proofs
     ):
         for operation in operations.readonly_iter():
             function(epochs_ctx, state, operation)
@@ -1037,12 +1026,17 @@ def slash_validator(epochs_ctx: EpochsContext, state: BeaconState,
 
 
 def process_proposer_slashing(epochs_ctx: EpochsContext, state: BeaconState, proposer_slashing: ProposerSlashing) -> None:
+    header_1 = proposer_slashing.signed_header_1.message
+    header_2 = proposer_slashing.signed_header_2.message
+
     # Verify header slots match
-    assert proposer_slashing.signed_header_1.message.slot == proposer_slashing.signed_header_2.message.slot
+    assert header_1.slot == header_2.slot
+    # Verify header proposer indices match
+    assert header_1.proposer_index == header_2.proposer_index
     # Verify the headers are different
-    assert proposer_slashing.signed_header_1 != proposer_slashing.signed_header_2
+    assert header_1 != header_2
     # Verify the proposer is slashable
-    proposer = state.validators[proposer_slashing.proposer_index]
+    proposer = state.validators[header_1.proposer_index]
     assert is_slashable_validator(proposer, epochs_ctx.current_shuffling.epoch)
     # Verify signatures
     for signed_header in (proposer_slashing.signed_header_1, proposer_slashing.signed_header_2):
@@ -1050,7 +1044,7 @@ def process_proposer_slashing(epochs_ctx: EpochsContext, state: BeaconState, pro
         signing_root = compute_signing_root(signed_header.message, domain)
         assert bls.Verify(proposer.pubkey, signing_root, signed_header.signature)
 
-    slash_validator(epochs_ctx, state, proposer_slashing.proposer_index)
+    slash_validator(epochs_ctx, state, header_1.proposer_index)
 
 
 def process_attester_slashing(epochs_ctx: EpochsContext, state: BeaconState, attester_slashing: AttesterSlashing) -> None:
@@ -1252,9 +1246,8 @@ def process_block(epochs_ctx: EpochsContext, state: BeaconState, block: BeaconBl
     process_operations(epochs_ctx, state, block.body)
 
 
-def verify_block_signature(epochs_ctx: EpochsContext, state: BeaconState, signed_block: SignedBeaconBlock) -> bool:
-    proposer_index = epochs_ctx.get_beacon_proposer(state.slot)
-    proposer = state.validators[proposer_index]
+def verify_block_signature(state: BeaconState, signed_block: SignedBeaconBlock) -> bool:
+    proposer = state.validators[signed_block.message.proposer_index]
     signing_root = compute_signing_root(signed_block.message, get_domain(state, DOMAIN_BEACON_PROPOSER))
     return bls.Verify(proposer.pubkey, signing_root, signed_block.signature)
 
@@ -1266,7 +1259,7 @@ def state_transition(epochs_ctx: EpochsContext, state: BeaconState,
     process_slots(epochs_ctx, state, block.slot)
     # Verify signature
     if validate_result:
-        assert verify_block_signature(epochs_ctx, state, signed_block), "invalid block signature"
+        assert verify_block_signature(state, signed_block), "invalid block signature"
     # Process block
     process_block(epochs_ctx, state, block)
     # Verify state root
