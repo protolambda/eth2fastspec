@@ -572,7 +572,7 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
         if v.activation_epoch == FAR_FUTURE_EPOCH and v.activation_eligibility_epoch <= current_epoch:
             out.indices_to_maybe_activate.append(ValidatorIndex(i))
 
-        if not status.active and v.effective_balance <= EJECTION_BALANCE and v.exit_epoch == FAR_FUTURE_EPOCH:
+        if status.active and v.effective_balance <= EJECTION_BALANCE and v.exit_epoch == FAR_FUTURE_EPOCH:
             out.indices_to_eject.append(ValidatorIndex(i))
 
         out.statuses.append(status)
