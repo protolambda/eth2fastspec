@@ -16,7 +16,6 @@ A few new objects are introduced for precomputed data, speeding up the transitio
     - `rotate_epochs()` to re-use information, such as the shuffling of the next epoch, after transitioning into a new epoch, the `rotate_epochs()` is called. The transition function takes care of epoch-context data rotation.
 - `FlatValidator`: A copy of the regular `Validator`, but in a simple object instead of a tree-representation. For intermediate computation the remerkleable representation slows things down, so a regular object is used instead.
 - `AttesterStatus`: During the epoch transition, additional data is precomputed to avoid traversing any state a second time. Attestations are a big part of this, and each validator has an "status" to represent its precomputed participation.
-- `EpochStakeSummary`: During attestation preprocessing, the different FFG totals are precomputed as well. This is then used during justification/finalization and attestation deltas processing.
 - `EpochProcess`: The `AttesterStatus` (and `FlatValidator` under `status.validator`) objects and `EpochStakeSummary` are tracked in the `EpochProcess` and made available as additional context in the epoch transition.
     - `prepare_epoch_process_state(epochs_ctx, state)` computes this data.
 

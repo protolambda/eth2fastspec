@@ -1,15 +1,6 @@
-from eth2spec.config.config_util import apply_constants_config
-from typing import Iterator, List as PyList, Sequence, Tuple, Dict, Optional
-
-from eth2spec.utils import bls
+from typing import Iterator, List as PyList
 
 from hashlib import sha256
-
-from eth2spec.utils.ssz.ssz_impl import hash_tree_root
-from eth2spec.utils.ssz.ssz_typing import (
-    View, boolean, Container, List, Vector, uint64,
-    Bytes1, Bytes4, Bytes8, Bytes32, Bytes48, Bytes96, Bitlist, Bitvector,
-)
 
 from eth2spec.phase0.spec import *
 
@@ -38,7 +29,6 @@ def xor(bytes_1: Bytes32, bytes_2: Bytes32) -> Bytes32:
 
 def hash(x):
     return sha256(x).digest()
-
 
 
 def compute_fork_data_root(current_version: Version, genesis_validators_root: Root) -> Root:
@@ -428,6 +418,10 @@ class AttesterStatus(object):
         self.active = False
 
 
+def has_markers(flags: int, markers: int) -> bool:
+    return flags & markers == markers
+
+
 class EpochStakeSummary(object):
 
     __slots__ = 'source_stake', 'target_stake', 'head_stake'
@@ -447,9 +441,9 @@ class EpochProcess(object):
     current_epoch: Epoch
     statuses: PyList[AttesterStatus]
     total_active_stake: Gwei
-    total_active_unslashed_stake: Gwei
-    prev_epoch_stake: EpochStakeSummary
-    curr_epoch_stake: EpochStakeSummary
+    prev_epoch_unslashed_stake: EpochStakeSummary
+    prev_epoch_target_stake: Gwei
+    curr_epoch_target_stake: Gwei
     active_validators: int  # Thanks to exit delay, this does not change within the epoch processing.
     indices_to_slash: PyList[ValidatorIndex]
     indices_to_set_activation_eligibility: PyList[ValidatorIndex]
@@ -467,9 +461,9 @@ class EpochProcess(object):
         self.prev_epoch = Epoch(0)
         self.statuses = []
         self.total_active_stake = Gwei(0)
-        self.total_active_unslashed_stake = Gwei(0)
-        self.prev_epoch_stake = EpochStakeSummary()
-        self.curr_epoch_stake = EpochStakeSummary()
+        self.prev_epoch_unslashed_stake = EpochStakeSummary()
+        self.prev_epoch_target_stake = Gwei(0)
+        self.curr_epoch_target_stake = Gwei(0)
         self.active_validators = 0
         self.indices_to_slash = []
         self.indices_to_set_activation_eligibility = []
@@ -560,8 +554,6 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
             status.active = True
             out.total_active_stake += v.effective_balance
             active_count += 1
-            if not v.slashed:
-                out.total_active_unslashed_stake += v.effective_balance
 
         if v.exit_epoch != FAR_FUTURE_EPOCH and v.exit_epoch > exit_queue_end:
             exit_queue_end = v.exit_epoch
@@ -600,13 +592,9 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
 
     def status_process_epoch(statuses: Sequence[AttesterStatus],
                              attestations: Iterator[PendingAttestation],
-                             epoch_stake_sum: EpochStakeSummary,
                              epoch: Epoch, source_flag: int, target_flag: int, head_flag: int):
 
         actual_target_block_root = get_block_root_at_slot(state, compute_start_slot_at_epoch(epoch))
-
-        # Python quirk; avoid Gwei during summation here, not worth the __add__ overhead.
-        source_stake, target_stake, head_stake = 0, 0, 0
 
         for att in attestations:
             # Load all the attestation details from the state tree once, do not reload for each participant.
@@ -637,28 +625,42 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
 
                 # remember the participant as one of the good validators
                 status.flags |= source_flag
-                source_stake += status.validator.effective_balance
 
                 # If the attestation is for the boundary:
                 if att_voted_target_root:
                     status.flags |= target_flag
-                    target_stake += status.validator.effective_balance
 
                     # Head votes must be a subset of target votes
                     if att_voted_head_root:
                         status.flags |= head_flag
-                        head_stake += status.validator.effective_balance
 
-        epoch_stake_sum.source_stake = source_stake
-        epoch_stake_sum.target_stake = target_stake
-        epoch_stake_sum.head_stake = head_stake
-
-    status_process_epoch(out.statuses, state.previous_epoch_attestations.readonly_iter(),
-                         out.prev_epoch_stake, prev_epoch,
+    status_process_epoch(out.statuses, state.previous_epoch_attestations.readonly_iter(), prev_epoch,
                          FLAG_PREV_SOURCE_ATTESTER, FLAG_PREV_TARGET_ATTESTER, FLAG_PREV_HEAD_ATTESTER)
-    status_process_epoch(out.statuses, state.current_epoch_attestations.readonly_iter(),
-                         out.curr_epoch_stake, current_epoch,
+    status_process_epoch(out.statuses, state.current_epoch_attestations.readonly_iter(), current_epoch,
                          FLAG_CURR_SOURCE_ATTESTER, FLAG_CURR_TARGET_ATTESTER, FLAG_CURR_HEAD_ATTESTER)
+
+    # Python quirk; avoid Gwei during summation here, not worth the __add__ overhead.
+    prev_source_unsl_stake, prev_target_unsl_stake, prev_head_unsl_stake = 0, 0, 0
+    prev_target_stake, curr_target_stake = 0, 0
+
+    for status in out.statuses:
+        if has_markers(status.flags, FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED):
+            prev_source_unsl_stake += status.validator.effective_balance
+            if has_markers(status.flags, FLAG_PREV_TARGET_ATTESTER):
+                prev_target_unsl_stake += status.validator.effective_balance
+                if has_markers(status.flags, FLAG_PREV_HEAD_ATTESTER):
+                    prev_head_unsl_stake += status.validator.effective_balance
+        if has_markers(status.flags, FLAG_PREV_TARGET_ATTESTER):
+            prev_target_stake += status.validator.effective_balance
+        if has_markers(status.flags, FLAG_CURR_TARGET_ATTESTER):
+            curr_target_stake += status.validator.effective_balance
+
+    out.prev_epoch_unslashed_stake.source_stake = prev_source_unsl_stake
+    out.prev_epoch_unslashed_stake.target_stake = prev_target_unsl_stake
+    out.prev_epoch_unslashed_stake.head_stake = prev_head_unsl_stake
+    out.prev_epoch_target_stake = prev_target_stake
+    out.curr_epoch_target_stake = curr_target_stake
+
     return out
 
 
@@ -714,11 +716,11 @@ def process_justification_and_finalization(epochs_ctx: EpochsContext, process: E
     # shift bits, zero out new bit space
     bits[1:] = bits[:-1]
     bits[0] = 0b0
-    if process.prev_epoch_stake.target_stake * 3 >= process.total_active_stake * 2:
+    if process.prev_epoch_target_stake * 3 >= process.total_active_stake * 2:
         state.current_justified_checkpoint = Checkpoint(epoch=previous_epoch,
                                                         root=get_block_root(state, previous_epoch))
         bits[1] = 0b1
-    if process.curr_epoch_stake.target_stake * 3 >= process.total_active_stake * 2:
+    if process.curr_epoch_target_stake * 3 >= process.total_active_stake * 2:
         state.current_justified_checkpoint = Checkpoint(epoch=current_epoch,
                                                         root=get_block_root(state, current_epoch))
         bits[0] = 0b1
@@ -745,24 +747,17 @@ def get_attestation_deltas(epochs_ctx: EpochsContext, process: EpochProcess, sta
     rewards = [0 for _ in range(validator_count)]
     penalties = [0 for _ in range(validator_count)]
 
-    total_balance = process.total_active_unslashed_stake
+    total_balance = process.total_active_stake
     if total_balance == 0:
         total_balance = 1
 
     def has_markers(flags: int, markers: int) -> bool:
         return flags & markers == markers
 
-    def get_attesters_stake(flags) -> Gwei:
-        stake = 0
-        for st in process.statuses:
-            if has_markers(st.flags, flags):
-                stake += st.validator.effective_balance
-        return Gwei(stake)
-
     increment = EFFECTIVE_BALANCE_INCREMENT  # Factored out from balance totals to avoid uint64 overflow
-    prev_epoch_source_stake = get_attesters_stake(FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED) // increment
-    prev_epoch_target_stake = get_attesters_stake(FLAG_PREV_TARGET_ATTESTER | FLAG_UNSLASHED) // increment
-    prev_epoch_head_stake = get_attesters_stake(FLAG_PREV_HEAD_ATTESTER | FLAG_UNSLASHED) // increment
+    prev_epoch_source_stake = process.prev_epoch_unslashed_stake.source_stake // increment
+    prev_epoch_target_stake = process.prev_epoch_unslashed_stake.target_stake // increment
+    prev_epoch_head_stake = process.prev_epoch_unslashed_stake.head_stake // increment
 
     balance_sq_root = integer_squareroot(total_balance)
     finality_delay = process.prev_epoch - state.finalized_checkpoint.epoch
@@ -943,6 +938,9 @@ def process_randao(epochs_ctx: EpochsContext, state: BeaconState, body: BeaconBl
     # Mix in RANDAO reveal
     mix = xor(get_randao_mix(state, epoch), hash(body.randao_reveal))
     state.randao_mixes[epoch % EPOCHS_PER_HISTORICAL_VECTOR] = mix
+
+
+SLOTS_PER_ETH1_VOTING_PERIOD = EPOCHS_PER_ETH1_VOTING_PERIOD * SLOTS_PER_EPOCH
 
 
 def process_eth1_data(epochs_ctx: EpochsContext, state: BeaconState, body: BeaconBlockBody) -> None:
