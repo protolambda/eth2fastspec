@@ -765,21 +765,22 @@ def get_attestation_deltas(epochs_ctx: EpochsContext, process: EpochProcess, sta
     total_balance = total_balance // increment
 
     for i, status in enumerate(process.statuses):
+
+        eff_balance = status.validator.effective_balance
+        base_reward = eff_balance * BASE_REWARD_FACTOR // balance_sq_root // BASE_REWARDS_PER_EPOCH
+
+        # Inclusion speed bonus
+        if has_markers(status.flags, FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED):
+            proposer_reward = base_reward // PROPOSER_REWARD_QUOTIENT
+            rewards[status.proposer_index] += proposer_reward
+            max_attester_reward = base_reward - proposer_reward
+            rewards[i] += max_attester_reward // status.inclusion_delay
+
         if status.flags & FLAG_ELIGIBLE_ATTESTER != 0:
-
-            eff_balance = status.validator.effective_balance
-            base_reward = eff_balance * BASE_REWARD_FACTOR // balance_sq_root // BASE_REWARDS_PER_EPOCH
-
             # Expected FFG source
             if has_markers(status.flags, FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED):
                 # Justification-participation reward
                 rewards[i] += base_reward * prev_epoch_source_stake // total_balance
-
-                # Inclusion speed bonus
-                proposer_reward = base_reward // PROPOSER_REWARD_QUOTIENT
-                rewards[status.proposer_index] += proposer_reward
-                max_attester_reward = base_reward - proposer_reward
-                rewards[i] += max_attester_reward // status.inclusion_delay
             else:
                 # Justification-non-participation R-penalty
                 penalties[i] += base_reward
@@ -803,7 +804,7 @@ def get_attestation_deltas(epochs_ctx: EpochsContext, process: EpochProcess, sta
             # Take away max rewards if we're not finalizing
             if finality_delay > MIN_EPOCHS_TO_INACTIVITY_PENALTY:
                 penalties[i] += base_reward * BASE_REWARDS_PER_EPOCH
-                if not has_markers(status.flags, FLAG_PREV_HEAD_ATTESTER | FLAG_UNSLASHED):
+                if not has_markers(status.flags, FLAG_PREV_TARGET_ATTESTER | FLAG_UNSLASHED):
                     penalties[i] += eff_balance * finality_delay // INACTIVITY_PENALTY_QUOTIENT
 
     return list(map(Gwei, rewards)), list(map(Gwei, penalties))
