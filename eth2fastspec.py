@@ -747,18 +747,18 @@ def get_attestation_deltas(epochs_ctx: EpochsContext, process: EpochProcess, sta
     rewards = [0 for _ in range(validator_count)]
     penalties = [0 for _ in range(validator_count)]
 
-    total_balance = process.total_active_stake
-    if total_balance == 0:
-        total_balance = 1
-
     def has_markers(flags: int, markers: int) -> bool:
         return flags & markers == markers
 
-    increment = EFFECTIVE_BALANCE_INCREMENT  # Factored out from balance totals to avoid uint64 overflow
-    prev_epoch_source_stake = process.prev_epoch_unslashed_stake.source_stake // increment
-    prev_epoch_target_stake = process.prev_epoch_unslashed_stake.target_stake // increment
-    prev_epoch_head_stake = process.prev_epoch_unslashed_stake.head_stake // increment
+    increment = EFFECTIVE_BALANCE_INCREMENT
+    total_balance = max(process.total_active_stake, increment)
 
+    # Increment is factored out from balance totals to avoid uint64 overflow
+    prev_epoch_source_stake = max(process.prev_epoch_unslashed_stake.source_stake, increment) // increment
+    prev_epoch_target_stake = max(process.prev_epoch_unslashed_stake.target_stake, increment) // increment
+    prev_epoch_head_stake = max(process.prev_epoch_unslashed_stake.head_stake, increment) // increment
+
+    # Sqrt first, before factoring out the increment for later usage.
     balance_sq_root = integer_squareroot(total_balance)
     finality_delay = process.prev_epoch - state.finalized_checkpoint.epoch
 
