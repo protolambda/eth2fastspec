@@ -2,10 +2,29 @@ from typing import Iterator, List as PyList
 
 from hashlib import sha256
 
+import milagro_bls_binding as milagro_bls
+
 from eth2spec.phase0.spec import *
 
 
 apply_constants_config(globals())
+
+def bls_Verify(PK, message, signature):
+    try:
+        result = milagro_bls.Verify(PK, message, signature)
+    except Exception:
+        result = False
+    finally:
+        return result
+
+
+def bls_FastAggregateVerify(pubkeys, message, signature):
+    try:
+        result = milagro_bls.FastAggregateVerify(list(pubkeys), message, signature)
+    except Exception:
+        result = False
+    finally:
+        return result
 
 
 def integer_squareroot(n: uint64) -> uint64:
@@ -242,7 +261,7 @@ class ShufflingEpoch(object):
             index = (slot * committees_per_slot) + comm_index
             start_offset = (active_validator_count * index) // committee_count
             end_offset = (active_validator_count * (index + 1)) // committee_count
-            assert start_offset < end_offset
+            assert start_offset <= end_offset
             return self.shuffling[start_offset:end_offset]
 
         self.committees = [[slice_committee(slot, comm_index) for comm_index in range(committees_per_slot)]
@@ -908,17 +927,19 @@ def process_final_updates(epochs_ctx: EpochsContext, process: EpochProcess, stat
 
 
 def process_block_header(epochs_ctx: EpochsContext, state: BeaconState, block: BeaconBlock) -> None:
-    slot = state.slot
     # Verify that the slots match
-    assert block.slot == slot
+    assert block.slot == state.slot
+    # Verify that the block is newer than latest block header
+    assert block.slot > state.latest_block_header.slot
     # Verify that proposer index is the correct index
-    proposer_index = epochs_ctx.get_beacon_proposer(slot)
+    proposer_index = epochs_ctx.get_beacon_proposer(state.slot)
     assert block.proposer_index == proposer_index
     # Verify that the parent matches
     assert block.parent_root == hash_tree_root(state.latest_block_header)
     # Cache current block as the new latest block
     state.latest_block_header = BeaconBlockHeader(
-        slot=slot,
+        slot=block.slot,
+        proposer_index=block.proposer_index,
         parent_root=block.parent_root,
         state_root=Bytes32(),  # Overwritten in the next process_slot call
         body_root=hash_tree_root(block.body),
@@ -935,7 +956,7 @@ def process_randao(epochs_ctx: EpochsContext, state: BeaconState, body: BeaconBl
     proposer_index = epochs_ctx.get_beacon_proposer(state.slot)
     proposer_pubkey = epochs_ctx.index2pubkey[proposer_index]
     signing_root = compute_signing_root(epoch, get_domain(state, DOMAIN_RANDAO))
-    assert bls.Verify(proposer_pubkey, signing_root, body.randao_reveal)
+    assert bls_Verify(proposer_pubkey, signing_root, body.randao_reveal)
     # Mix in RANDAO reveal
     mix = xor(get_randao_mix(state, epoch), hash(body.randao_reveal))
     state.randao_mixes[epoch % EPOCHS_PER_HISTORICAL_VECTOR] = mix
@@ -1051,7 +1072,7 @@ def process_proposer_slashing(epochs_ctx: EpochsContext, state: BeaconState, pro
     for signed_header in (proposer_slashing.signed_header_1, proposer_slashing.signed_header_2):
         domain = get_domain(state, DOMAIN_BEACON_PROPOSER, compute_epoch_at_slot(signed_header.message.slot))
         signing_root = compute_signing_root(signed_header.message, domain)
-        assert bls.Verify(proposer.pubkey, signing_root, signed_header.signature)
+        assert bls_Verify(proposer.pubkey, signing_root, signed_header.signature)
 
     slash_validator(epochs_ctx, state, header_1.proposer_index)
 
@@ -1077,21 +1098,17 @@ def process_attester_slashing(epochs_ctx: EpochsContext, state: BeaconState, att
 
 def is_valid_indexed_attestation(epochs_ctx: EpochsContext, state: BeaconState, indexed_attestation: IndexedAttestation) -> bool:
     """
-    Check if ``indexed_attestation`` has valid indices and signature.
+    Check if ``indexed_attestation`` has sorted and unique indices and a valid aggregate signature.
     """
-    indices = list(indexed_attestation.attesting_indices.readonly_iter())
-
-    # Verify max number of indices
-    if not len(indices) <= MAX_VALIDATORS_PER_COMMITTEE:
-        return False
     # Verify indices are sorted and unique
+    indices = list(indexed_attestation.attesting_indices.readonly_iter())
     if not indices == sorted(set(indices)):
         return False
     # Verify aggregate signature
     pubkeys = [epochs_ctx.index2pubkey[i] for i in indices]
     domain = get_domain(state, DOMAIN_BEACON_ATTESTER, indexed_attestation.data.target.epoch)  # TODO maybe optimize get_domain?
     signing_root = compute_signing_root(indexed_attestation.data, domain)
-    return bls.FastAggregateVerify(pubkeys, signing_root, indexed_attestation.signature)
+    return bls_FastAggregateVerify(pubkeys, signing_root, indexed_attestation.signature)
 
 
 def process_attestation(epochs_ctx: EpochsContext, state: BeaconState, attestation: Attestation) -> None:
@@ -1172,7 +1189,7 @@ def process_deposit(epochs_ctx: EpochsContext, state: BeaconState, deposit: Depo
         )
         domain = compute_domain(DOMAIN_DEPOSIT)  # Fork-agnostic domain since deposits are valid across forks
         signing_root = compute_signing_root(deposit_message, domain)
-        if not bls.Verify(pubkey, signing_root, deposit.data.signature):
+        if not bls_Verify(pubkey, signing_root, deposit.data.signature):
             return
 
         # Add validator and balance entries
@@ -1209,7 +1226,7 @@ def process_voluntary_exit(epochs_ctx: EpochsContext, state: BeaconState, signed
     # Verify signature
     domain = get_domain(state, DOMAIN_VOLUNTARY_EXIT, voluntary_exit.epoch)
     signing_root = compute_signing_root(voluntary_exit, domain)
-    assert bls.Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)
+    assert bls_Verify(validator.pubkey, signing_root, signed_voluntary_exit.signature)
     # Initiate exit
     # TODO could be optimized, but happens too rarely
     initiate_validator_exit(epochs_ctx, state, voluntary_exit.validator_index)
@@ -1228,7 +1245,7 @@ def process_slot(epochs_ctx: EpochsContext, state: BeaconState) -> None:
 
 
 def process_slots(epochs_ctx: EpochsContext, state: BeaconState, slot: Slot) -> None:
-    assert state.slot <= slot
+    assert state.slot < slot
     while state.slot < slot:
         process_slot(epochs_ctx, state)
         # Process epoch on the start slot of the next epoch
@@ -1259,7 +1276,7 @@ def process_block(epochs_ctx: EpochsContext, state: BeaconState, block: BeaconBl
 def verify_block_signature(state: BeaconState, signed_block: SignedBeaconBlock) -> bool:
     proposer = state.validators[signed_block.message.proposer_index]
     signing_root = compute_signing_root(signed_block.message, get_domain(state, DOMAIN_BEACON_PROPOSER))
-    return bls.Verify(proposer.pubkey, signing_root, signed_block.signature)
+    return bls_Verify(proposer.pubkey, signing_root, signed_block.signature)
 
 
 def state_transition(epochs_ctx: EpochsContext, state: BeaconState,

@@ -18,7 +18,9 @@ setup(
     py_modules=["eth2fastspec"],
     tests_require=[],
     install_requires=[
-        "eth2spec>=0.11.0,<0.12"
+        "eth2spec>=0.11.3,<0.12",
+        "remerkleable==0.1.16",
+        "milagro_bls_binding==1.0.2",  # Old milagro bindings, to use spec 0.11 BLS
     ],
     include_package_data=False,
     keywords=["eth2", "pyspec", "eth2spec"],
