@@ -970,7 +970,14 @@ def process_eth1_data(epochs_ctx: EpochsContext, state: BeaconState, body: Beaco
     state.eth1_data_votes.append(new_eth1_data)
     if state.eth1_data == new_eth1_data:
         return  # Nothing to do if the state already has this as eth1data (happens a lot after majority vote is in)
-    if list(state.eth1_data_votes.readonly_iter()).count(new_eth1_data) * 2 > SLOTS_PER_ETH1_VOTING_PERIOD:
+    # `.count()` is slow due to type checks, calls len() repeatedly,
+    # and wrong when applied to list(state.eth1_data_votes.readonly_iter())
+    # Avoid it, and instead, count the votes manually
+    votes = 0
+    for vote in state.eth1_data_votes.readonly_iter():
+        if vote.hash_tree_root() == new_eth1_data.hash_tree_root():
+            votes += 1
+    if votes * 2 > SLOTS_PER_ETH1_VOTING_PERIOD:
         state.eth1_data = new_eth1_data
 
 
