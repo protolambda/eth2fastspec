@@ -588,6 +588,8 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
 
         out.statuses.append(status)
 
+    out.active_validators = active_count
+
     if out.total_active_stake < EFFECTIVE_BALANCE_INCREMENT:
         out.total_active_stake = EFFECTIVE_BALANCE_INCREMENT
 
@@ -612,7 +614,6 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
     def status_process_epoch(statuses: Sequence[AttesterStatus],
                              attestations: Iterator[PendingAttestation],
                              epoch: Epoch, source_flag: int, target_flag: int, head_flag: int):
-
         actual_target_block_root = get_block_root_at_slot(state, compute_start_slot_at_epoch(epoch))
 
         for att in attestations:
@@ -653,10 +654,15 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
                     if att_voted_head_root:
                         status.flags |= head_flag
 
-    status_process_epoch(out.statuses, state.previous_epoch_attestations.readonly_iter(), prev_epoch,
-                         FLAG_PREV_SOURCE_ATTESTER, FLAG_PREV_TARGET_ATTESTER, FLAG_PREV_HEAD_ATTESTER)
-    status_process_epoch(out.statuses, state.current_epoch_attestations.readonly_iter(), current_epoch,
-                         FLAG_CURR_SOURCE_ATTESTER, FLAG_CURR_TARGET_ATTESTER, FLAG_CURR_HEAD_ATTESTER)
+    # When used in a non-epoch transition on top of genesis state, avoid reaching to a block from before genesis.
+    if state.slot > 0:
+        status_process_epoch(out.statuses, state.previous_epoch_attestations.readonly_iter(), prev_epoch,
+                             FLAG_PREV_SOURCE_ATTESTER, FLAG_PREV_TARGET_ATTESTER, FLAG_PREV_HEAD_ATTESTER)
+    # When used in a non-epoch transition, it may be the absolute start of the epoch,
+    # and the current epoch will not have any attestations (or a target block root to match them against)
+    if compute_start_slot_at_epoch(current_epoch) < state.slot:
+        status_process_epoch(out.statuses, state.current_epoch_attestations.readonly_iter(), current_epoch,
+                             FLAG_CURR_SOURCE_ATTESTER, FLAG_CURR_TARGET_ATTESTER, FLAG_CURR_HEAD_ATTESTER)
 
     # Python quirk; avoid Gwei during summation here, not worth the __add__ overhead.
     prev_source_unsl_stake, prev_target_unsl_stake, prev_head_unsl_stake = 0, 0, 0
