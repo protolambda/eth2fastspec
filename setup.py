@@ -19,7 +19,7 @@ setup(
     tests_require=[],
     install_requires=[
         "eth2spec>=0.12.1,<0.13",
-        "remerkleable>=0.1.17",
+        "remerkleable>=0.1.16",
         "milagro_bls_binding==1.3.0",
     ],
     include_package_data=False,
