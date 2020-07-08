@@ -6,7 +6,7 @@ with open("README.md", "rt", encoding="utf8") as f:
 setup(
     name="eth2fastspec",
     description="Optimized version of eth2spec",
-    version="0.0.2",
+    version="0.0.3",
     long_description=readme,
     long_description_content_type="text/markdown",
     author="protolambda",
@@ -18,9 +18,9 @@ setup(
     py_modules=["eth2fastspec"],
     tests_require=[],
     install_requires=[
-        "eth2spec>=0.11.3,<0.12",
-        "remerkleable==0.1.16",
-        "milagro_bls_binding==1.0.2",  # Old milagro bindings, to use spec 0.11 BLS
+        "eth2spec>=0.12.1,<0.13",
+        "remerkleable>=0.1.17",
+        "milagro_bls_binding==1.3.0",
     ],
     include_package_data=False,
     keywords=["eth2", "pyspec", "eth2spec"],

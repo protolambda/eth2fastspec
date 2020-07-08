@@ -1,4 +1,4 @@
-from typing import Iterator, List as PyList
+from typing import Iterator, List as PyList, NamedTuple
 
 from hashlib import sha256
 
@@ -767,10 +767,32 @@ def process_justification_and_finalization(epochs_ctx: EpochsContext, process: E
         state.finalized_checkpoint = old_current_justified_checkpoint
 
 
-def get_attestation_deltas(epochs_ctx: EpochsContext, process: EpochProcess, state: BeaconState) -> Tuple[Sequence[Gwei], Sequence[Gwei]]:
+class Deltas(NamedTuple):
+    rewards: Sequence[Gwei]
+    penalties: Sequence[Gwei]
+
+
+class RewardsAndPenalties(NamedTuple):
+    source: Deltas
+    target: Deltas
+    head: Deltas
+    inclusion_delay: Deltas
+    inactivity: Deltas
+
+
+def mk_rew_pen(size: int) -> RewardsAndPenalties:
+    return RewardsAndPenalties(
+        source=Deltas([Gwei(0)] * size, [Gwei(0)] * size),
+        target=Deltas([Gwei(0)] * size, [Gwei(0)] * size),
+        head=Deltas([Gwei(0)] * size, [Gwei(0)] * size),
+        inclusion_delay=Deltas([Gwei(0)] * size, [Gwei(0)] * size),
+        inactivity=Deltas([Gwei(0)] * size, [Gwei(0)] * size),
+    )
+
+
+def get_attestation_rewards_and_penalties(epochs_ctx: EpochsContext, process: EpochProcess, state: BeaconState) -> RewardsAndPenalties:
     validator_count = len(process.statuses)
-    rewards = [0 for _ in range(validator_count)]
-    penalties = [0 for _ in range(validator_count)]
+    res = mk_rew_pen(validator_count)
 
     def has_markers(flags: int, markers: int) -> bool:
         return flags & markers == markers
@@ -778,78 +800,112 @@ def get_attestation_deltas(epochs_ctx: EpochsContext, process: EpochProcess, sta
     increment = EFFECTIVE_BALANCE_INCREMENT
     total_balance = max(process.total_active_stake, increment)
 
-    # Increment is factored out from balance totals to avoid uint64 overflow
-    prev_epoch_source_stake = max(process.prev_epoch_unslashed_stake.source_stake, increment) // increment
-    prev_epoch_target_stake = max(process.prev_epoch_unslashed_stake.target_stake, increment) // increment
-    prev_epoch_head_stake = max(process.prev_epoch_unslashed_stake.head_stake, increment) // increment
+    prev_epoch_source_stake = max(process.prev_epoch_unslashed_stake.source_stake, increment)
+    prev_epoch_target_stake = max(process.prev_epoch_unslashed_stake.target_stake, increment)
+    prev_epoch_head_stake = max(process.prev_epoch_unslashed_stake.head_stake, increment)
 
     # Sqrt first, before factoring out the increment for later usage.
     balance_sq_root = integer_squareroot(total_balance)
     finality_delay = process.prev_epoch - state.finalized_checkpoint.epoch
 
-    total_balance = total_balance // increment
+    is_inactivity_leak = finality_delay > MIN_EPOCHS_TO_INACTIVITY_PENALTY
+
+    # All summed effective balances are normalized to effective-balance increments, to avoid overflows.
+    total_balance //= increment
+    prev_epoch_source_stake //= increment
+    prev_epoch_target_stake //= increment
+    prev_epoch_head_stake //= increment
 
     for i, status in enumerate(process.statuses):
 
         eff_balance = status.validator.effective_balance
         base_reward = eff_balance * BASE_REWARD_FACTOR // balance_sq_root // BASE_REWARDS_PER_EPOCH
+        proposer_reward = base_reward // PROPOSER_REWARD_QUOTIENT
 
         # Inclusion speed bonus
         if has_markers(status.flags, FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED):
-            proposer_reward = base_reward // PROPOSER_REWARD_QUOTIENT
-            rewards[status.proposer_index] += proposer_reward
+            res.inclusion_delay.rewards[status.proposer_index] += proposer_reward
             max_attester_reward = base_reward - proposer_reward
-            rewards[i] += max_attester_reward // status.inclusion_delay
+            res.inclusion_delay.rewards[i] += max_attester_reward // status.inclusion_delay
 
         if status.flags & FLAG_ELIGIBLE_ATTESTER != 0:
+            # In case of `is_inactivity_leak`:
+            # Since full base reward will be canceled out by inactivity penalty deltas,
+            # optimal participation receives full base reward compensation here.
+
             # Expected FFG source
             if has_markers(status.flags, FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED):
-                # Justification-participation reward
-                rewards[i] += base_reward * prev_epoch_source_stake // total_balance
+                if is_inactivity_leak:
+                    res.source.rewards[i] += base_reward
+                else:
+                    # Justification-participation reward
+                    res.source.rewards[i] += base_reward * prev_epoch_source_stake // total_balance
             else:
                 # Justification-non-participation R-penalty
-                penalties[i] += base_reward
+                res.source.penalties[i] += base_reward
 
             # Expected FFG target
             if has_markers(status.flags, FLAG_PREV_TARGET_ATTESTER | FLAG_UNSLASHED):
-                # Boundary-attestation reward
-                rewards[i] += base_reward * prev_epoch_target_stake // total_balance
+                if is_inactivity_leak:
+                    res.target.rewards[i] += base_reward
+                else:
+                    # Boundary-attestation reward
+                    res.target.rewards[i] += base_reward * prev_epoch_target_stake // total_balance
             else:
                 # Boundary-attestation-non-participation R-penalty
-                penalties[i] += base_reward
+                res.target.penalties[i] += base_reward
 
             # Expected head
             if has_markers(status.flags, FLAG_PREV_HEAD_ATTESTER | FLAG_UNSLASHED):
-                # Canonical-participation reward
-                rewards[i] += base_reward * prev_epoch_head_stake // total_balance
+                if is_inactivity_leak:
+                    res.head.rewards[i] += base_reward
+                else:
+                    # Canonical-participation reward
+                    res.head.rewards[i] += base_reward * prev_epoch_head_stake // total_balance
             else:
                 # Non-canonical-participation R-penalty
-                penalties[i] += base_reward
+                res.head.penalties[i] += base_reward
 
             # Take away max rewards if we're not finalizing
-            if finality_delay > MIN_EPOCHS_TO_INACTIVITY_PENALTY:
-                penalties[i] += base_reward * BASE_REWARDS_PER_EPOCH
+            if is_inactivity_leak:
+                # If validator is performing optimally this cancels all rewards for a neutral balance
+                res.inclusion_delay.penalties[i] += base_reward * BASE_REWARDS_PER_EPOCH - proposer_reward
                 if not has_markers(status.flags, FLAG_PREV_TARGET_ATTESTER | FLAG_UNSLASHED):
-                    penalties[i] += eff_balance * finality_delay // INACTIVITY_PENALTY_QUOTIENT
+                    res.inclusion_delay.penalties[i] += eff_balance * finality_delay // INACTIVITY_PENALTY_QUOTIENT
 
-    return list(map(Gwei, rewards)), list(map(Gwei, penalties))
+    return res
 
 
 def process_rewards_and_penalties(epochs_ctx: EpochsContext, process: EpochProcess, state: BeaconState) -> None:
     if process.current_epoch == GENESIS_EPOCH:
         return
 
-    rewards, penalties = get_attestation_deltas(epochs_ctx, process, state)
+    res = get_attestation_rewards_and_penalties(epochs_ctx, process, state)
     new_balances = list(map(int, state.balances.readonly_iter()))
 
-    for i, reward in enumerate(rewards):
-        new_balances[i] += reward
+    def add_rewards(deltas: Deltas):
+        for i, reward in enumerate(deltas.rewards):
+            new_balances[i] += reward
 
-    for i, penalty in enumerate(penalties):
-        if penalty > new_balances[i]:
-            new_balances[i] = 0
-        else:
-            new_balances[i] -= penalty
+    def add_penalties(deltas: Deltas):
+        for i, penalty in enumerate(deltas.penalties):
+            if penalty > new_balances[i]:
+                new_balances[i] = 0
+            else:
+                new_balances[i] -= penalty
+
+    add_rewards(res.source)
+    add_rewards(res.target)
+    add_rewards(res.head)
+    add_rewards(res.inclusion_delay)
+    add_rewards(res.inactivity)
+
+    add_penalties(res.source)
+    add_penalties(res.target)
+    add_penalties(res.head)
+    add_penalties(res.inclusion_delay)
+    add_penalties(res.inactivity)
+
     # Important: do not change state one balance at a time.
     # Set them all at once, constructing the tree in one go.
     state.balances = new_balances
@@ -1065,7 +1121,7 @@ def slash_validator(epochs_ctx: EpochsContext, state: BeaconState,
     whistleblower_reward = Gwei(validator.effective_balance // WHISTLEBLOWER_REWARD_QUOTIENT)
     proposer_reward = Gwei(whistleblower_reward // PROPOSER_REWARD_QUOTIENT)
     increase_balance(state, proposer_index, proposer_reward)
-    increase_balance(state, whistleblower_index, whistleblower_reward - proposer_reward)
+    increase_balance(state, whistleblower_index, Gwei(whistleblower_reward - proposer_reward))
 
 
 def process_proposer_slashing(epochs_ctx: EpochsContext, state: BeaconState, proposer_slashing: ProposerSlashing) -> None:
@@ -1115,7 +1171,7 @@ def is_valid_indexed_attestation(epochs_ctx: EpochsContext, state: BeaconState, 
     """
     # Verify indices are sorted and unique
     indices = list(indexed_attestation.attesting_indices.readonly_iter())
-    if not indices == sorted(set(indices)):
+    if len(indices) == 0 or not indices == sorted(set(indices)):
         return False
     # Verify aggregate signature
     pubkeys = [epochs_ctx.index2pubkey[i] for i in indices]
@@ -1235,7 +1291,7 @@ def process_voluntary_exit(epochs_ctx: EpochsContext, state: BeaconState, signed
     # Exits must specify an epoch when they become valid; they are not valid before then
     assert current_epoch >= voluntary_exit.epoch
     # Verify the validator has been active long enough
-    assert current_epoch >= validator.activation_epoch + PERSISTENT_COMMITTEE_PERIOD
+    assert current_epoch >= validator.activation_epoch + SHARD_COMMITTEE_PERIOD
     # Verify signature
     domain = get_domain(state, DOMAIN_VOLUNTARY_EXIT, voluntary_exit.epoch)
     signing_root = compute_signing_root(voluntary_exit, domain)
