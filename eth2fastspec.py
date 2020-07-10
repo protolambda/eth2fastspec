@@ -461,8 +461,7 @@ class EpochProcess(object):
     statuses: PyList[AttesterStatus]
     total_active_stake: Gwei
     prev_epoch_unslashed_stake: EpochStakeSummary
-    prev_epoch_target_stake: Gwei
-    curr_epoch_target_stake: Gwei
+    curr_epoch_unslashed_target_stake: Gwei
     active_validators: int  # Thanks to exit delay, this does not change within the epoch processing.
     indices_to_slash: PyList[ValidatorIndex]
     indices_to_set_activation_eligibility: PyList[ValidatorIndex]
@@ -481,8 +480,7 @@ class EpochProcess(object):
         self.statuses = []
         self.total_active_stake = Gwei(0)
         self.prev_epoch_unslashed_stake = EpochStakeSummary()
-        self.prev_epoch_target_stake = Gwei(0)
-        self.curr_epoch_target_stake = Gwei(0)
+        self.curr_epoch_unslashed_target_stake = Gwei(0)
         self.active_validators = 0
         self.indices_to_slash = []
         self.indices_to_set_activation_eligibility = []
@@ -666,7 +664,7 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
 
     # Python quirk; avoid Gwei during summation here, not worth the __add__ overhead.
     prev_source_unsl_stake, prev_target_unsl_stake, prev_head_unsl_stake = 0, 0, 0
-    prev_target_stake, curr_target_stake = 0, 0
+    curr_epoch_unslashed_target_stake = 0
 
     for status in out.statuses:
         if has_markers(status.flags, FLAG_PREV_SOURCE_ATTESTER | FLAG_UNSLASHED):
@@ -675,16 +673,13 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
                 prev_target_unsl_stake += status.validator.effective_balance
                 if has_markers(status.flags, FLAG_PREV_HEAD_ATTESTER):
                     prev_head_unsl_stake += status.validator.effective_balance
-        if has_markers(status.flags, FLAG_PREV_TARGET_ATTESTER):
-            prev_target_stake += status.validator.effective_balance
-        if has_markers(status.flags, FLAG_CURR_TARGET_ATTESTER):
-            curr_target_stake += status.validator.effective_balance
+        if has_markers(status.flags, FLAG_CURR_TARGET_ATTESTER | FLAG_UNSLASHED):
+            curr_epoch_unslashed_target_stake += status.validator.effective_balance
 
     out.prev_epoch_unslashed_stake.source_stake = prev_source_unsl_stake
     out.prev_epoch_unslashed_stake.target_stake = prev_target_unsl_stake
     out.prev_epoch_unslashed_stake.head_stake = prev_head_unsl_stake
-    out.prev_epoch_target_stake = prev_target_stake
-    out.curr_epoch_target_stake = curr_target_stake
+    out.curr_epoch_unslashed_target_stake = curr_epoch_unslashed_target_stake
 
     return out
 
@@ -741,11 +736,11 @@ def process_justification_and_finalization(epochs_ctx: EpochsContext, process: E
     # shift bits, zero out new bit space
     bits[1:] = bits[:-1]
     bits[0] = 0b0
-    if process.prev_epoch_target_stake * 3 >= process.total_active_stake * 2:
+    if process.prev_epoch_unslashed_stake.target_stake * 3 >= process.total_active_stake * 2:
         state.current_justified_checkpoint = Checkpoint(epoch=previous_epoch,
                                                         root=get_block_root(state, previous_epoch))
         bits[1] = 0b1
-    if process.curr_epoch_target_stake * 3 >= process.total_active_stake * 2:
+    if process.curr_epoch_unslashed_target_stake * 3 >= process.total_active_stake * 2:
         state.current_justified_checkpoint = Checkpoint(epoch=current_epoch,
                                                         root=get_block_root(state, current_epoch))
         bits[0] = 0b1
