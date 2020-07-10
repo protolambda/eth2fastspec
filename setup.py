@@ -6,7 +6,7 @@ with open("README.md", "rt", encoding="utf8") as f:
 setup(
     name="eth2fastspec",
     description="Optimized version of eth2spec",
-    version="0.0.4",
+    version="0.0.5",
     long_description=readme,
     long_description_content_type="text/markdown",
     author="protolambda",
