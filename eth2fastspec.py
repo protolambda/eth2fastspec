@@ -676,10 +676,10 @@ def prepare_epoch_process_state(epochs_ctx: EpochsContext, state: BeaconState) -
         if has_markers(status.flags, FLAG_CURR_TARGET_ATTESTER | FLAG_UNSLASHED):
             curr_epoch_unslashed_target_stake += status.validator.effective_balance
 
-    out.prev_epoch_unslashed_stake.source_stake = prev_source_unsl_stake
-    out.prev_epoch_unslashed_stake.target_stake = prev_target_unsl_stake
-    out.prev_epoch_unslashed_stake.head_stake = prev_head_unsl_stake
-    out.curr_epoch_unslashed_target_stake = curr_epoch_unslashed_target_stake
+    out.prev_epoch_unslashed_stake.source_stake = max(prev_source_unsl_stake, EFFECTIVE_BALANCE_INCREMENT)
+    out.prev_epoch_unslashed_stake.target_stake = max(prev_target_unsl_stake, EFFECTIVE_BALANCE_INCREMENT)
+    out.prev_epoch_unslashed_stake.head_stake = max(prev_head_unsl_stake, EFFECTIVE_BALANCE_INCREMENT)
+    out.curr_epoch_unslashed_target_stake = max(curr_epoch_unslashed_target_stake, EFFECTIVE_BALANCE_INCREMENT)
 
     return out
 
